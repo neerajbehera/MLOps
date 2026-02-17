@@ -1,0 +1,154 @@
+version: '3.8'
+
+services:
+  # ---------- Existing Services (unchanged) ----------
+  postgres:
+    image: postgres:13
+    container_name: mlops-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mlflow}
+      POSTGRES_USER: ${POSTGRES_USER:-mlflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - mlops-network
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: mlops-minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "8900:8900"   # Console UI
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-mlflow}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-mlflow123}
+    command: server /data --console-address ":8900"
+    volumes:
+      - minio_data:/data
+    networks:
+      - mlops-network
+    restart: unless-stopped
+
+  mlflow:
+    build: ./mlflow
+    container_name: mlops-mlflow
+    ports:
+      - "5001:5000"   # Changed to 5001 to avoid conflict (adjust if needed)
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://${POSTGRES_USER:-mlflow}:${POSTGRES_PASSWORD:-mlflow}@postgres/${POSTGRES_DB:-mlflow}
+      --default-artifact-root s3://mlflow/
+      --host 0.0.0.0
+    depends_on:
+      - postgres
+      - minio
+    networks:
+      - mlops-network
+    restart: unless-stopped
+
+  jupyter:
+    build: ./python
+    container_name: mlops-jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-mlflow}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-mlflow123}
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-arm64
+      # AWS credentials for boto3 (MLflow artifact upload)
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER:-mlflow}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:-mlflow123}
+      - AWS_ENDPOINT_URL_S3=http://minio:9000
+      - AWS_REGION=us-east-1
+      - GIT_PYTHON_REFRESH=quiet
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./scripts:/home/jovyan/scripts
+    networks:
+      - mlops-network
+    depends_on:
+      - mlflow
+      - minio
+      - spark-master
+    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+    restart: unless-stopped
+
+  # ---------- New Spark Services (based on your working example) ----------
+  spark-master:
+    build: ./spark            # Your custom image with Delta Lake JARs
+    container_name: spark-master
+    hostname: spark-master
+    ports:
+      - "8080:8080"           # Spark UI
+      - "7077:7077"           # Master RPC
+      - "4040:4040"           # Application UI (optional)
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+    volumes:
+      - ./scripts:/opt/spark/scripts   # Optional: for spark-submit jobs
+    networks:
+      - mlops-network
+    command: >
+      bash -c "
+      /opt/spark/sbin/start-master.sh &&
+      tail -f /opt/spark/logs/spark--org.apache.spark.deploy.master.Master*.out
+      "
+    restart: unless-stopped
+
+  spark-worker-1:
+    build: ./spark            # Same custom image
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_MASTER: spark://spark-master:7077
+    volumes:
+      - ./scripts:/opt/spark/scripts
+    networks:
+      - mlops-network
+    command: >
+      bash -c "
+      /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
+      tail -f /opt/spark/logs/spark--org.apache.spark.deploy.worker.Worker*.out
+      "
+    restart: unless-stopped
+
+  # Optional second worker (uncomment if needed)
+  # spark-worker-2:
+  #   build: ./spark
+  #   container_name: spark-worker-2
+  #   hostname: spark-worker-2
+  #   depends_on:
+  #     - spark-master
+  #   environment:
+  #     SPARK_WORKER_CORES: 2
+  #     SPARK_WORKER_MEMORY: 2g
+  #     SPARK_MASTER: spark://spark-master:7077
+  #   volumes:
+  #     - ./scripts:/opt/spark/scripts
+  #   networks:
+  #     - mlops-network
+  #   command: >
+  #     bash -c "
+  #     /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
+  #     tail -f /opt/spark/logs/spark--org.apache.spark.deploy.worker.Worker*.out
+  #     "
+  #   restart: unless-stopped
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  mlops-network:
+    driver: bridge
